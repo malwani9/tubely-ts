@@ -1,10 +1,11 @@
 import { respondWithJSON } from "./json";
 
 import { type ApiConfig } from "../config";
-import { s3, S3Client, stdout, type BunRequest } from "bun";
+import { type BunRequest } from "bun";
 import { getBearerToken, validateJWT } from "../auth";
-import { getVideo, updateVideo } from "../db/videos";
+import { getVideo, updateVideo,  } from "../db/videos";
 import { BadRequestError, UserForbiddenError } from "./errors";
+import { uploadtoS3 } from "./s3";
 
 export async function handlerUploadVideo(cfg: ApiConfig, req: BunRequest) {
   
@@ -42,19 +43,19 @@ export async function handlerUploadVideo(cfg: ApiConfig, req: BunRequest) {
 
   const ratio = await getVideoAspectRatio(tempFilePath);
 
-  const client = cfg.s3Client;
-  const s3File = client.file(`${ratio}/${videoId}.mp4`);
+  const fastStartFile = await processVideoForFastStart(tempFilePath);
+  let key  = `${ratio}/${videoId}.mp4`;
 
-  await s3File.write(Bun.file(tempFilePath), {
-    type: "video/mp4",
-  });
+  await uploadtoS3(cfg, key, fastStartFile, "video/mp4");
 
-  await Bun.file("./temp/temp.mp4").delete();
-  
-  let url  = `https://${cfg.s3Bucket}.s3.eu-north-1.amazonaws.com/${ratio}/${videoId}.mp4`;
 
-  videoMeta.videoURL = url;
+  await Bun.file(tempFilePath).delete();
+  await Bun.file(fastStartFile).delete();
+
+
+  videoMeta.videoURL = `${cfg.s3CfDistribution}/${key}`;
   updateVideo(cfg.db, videoMeta);
+
 
   return respondWithJSON(200, null);
 }
@@ -70,12 +71,13 @@ async function getVideoAspectRatio(filePath: string) {
       const stdoutText = await new Response(process.stdout).text();
       const stderrText = await new Response(process.stderr).text();
 
-      if (await process.exited !== 0) {
+      const exited = await process.exited
+      if (exited !== 0) {
         throw  new Error(`ffprobe error: ${stderrText}`);
       }
 
       const JsonOutput = JSON.parse(stdoutText);
-      if (!JsonOutput.stream || JsonOutput.stream.length === 0) {
+      if (!JsonOutput.streams || JsonOutput.streams.length === 0) {
         throw new Error(`No video stream found`);
       }
       const { width, height } = JsonOutput.streams[0];
@@ -91,4 +93,20 @@ function classifyRatio(width: number, height: number) {
   if (Math.abs(value - 16 / 9) <= tolerance) return "landscape";
   if (Math.abs(value - 9 / 16) <= tolerance) return "portrait";
   return "other";
+}
+
+
+async function processVideoForFastStart(inputFilePath: string) {
+
+  let outputFilePath = inputFilePath.replace('.mp4','.processed.mp4');
+  
+  const process = Bun.spawn(["ffmpeg", "-i", inputFilePath, "-movflags", "faststart",
+    "-map_metadata", "0", "-codec", "copy", "-f", "mp4", outputFilePath]);
+
+  const exited = await process.exited
+  if (exited !== 0) {
+    throw  new Error(`ffprobe error: ${process.stderr}`);
+  }
+
+  return outputFilePath
 }
